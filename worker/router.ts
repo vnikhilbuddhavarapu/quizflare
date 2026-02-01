@@ -1,6 +1,6 @@
 import type { Env } from "./env";
 import { notFound } from "./shared/http";
-import { handleCreateRoom } from "./routes/rooms";
+import { handleCreateRoom, handleJoinRoom } from "./routes/rooms";
 import { handleRoomWebSocket } from "./routes/ws";
 
 export async function route(request: Request, env: Env): Promise<Response> {
@@ -8,6 +8,10 @@ export async function route(request: Request, env: Env): Promise<Response> {
 
   if (url.pathname === "/api/rooms/create") {
     return handleCreateRoom(request, env);
+  }
+
+  if (url.pathname === "/api/rooms/join") {
+    return handleJoinRoom(request, env);
   }
 
   const wsPrefix = "/ws/room/";
