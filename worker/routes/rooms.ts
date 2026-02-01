@@ -111,8 +111,15 @@ export async function handleJoinRoom(
   });
 
   if (!joinResp.ok) {
-    log("error", "room.join.failed", { reqId, status: joinResp.status });
-    return json({ error: { code: "join_failed" } }, { status: 502 });
+    log("warn", "room.join.rejected", { reqId, status: joinResp.status });
+    const text = await joinResp.text().catch(() => "");
+    return new Response(text || null, {
+      status: joinResp.status,
+      headers: {
+        "Content-Type":
+          joinResp.headers.get("Content-Type") ?? "application/json",
+      },
+    });
   }
 
   const joinData = (await joinResp.json()) as unknown;

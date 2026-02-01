@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ConnectedMsg, LobbyState, RoleHint, WsStatus } from "../types";
+import type {
+  ClientMsg,
+  ConnectedMsg,
+  GameState,
+  LobbyState,
+  RoleHint,
+  WsStatus,
+} from "../types";
 
 function nowLine(line: string) {
   return new Date().toLocaleTimeString() + "  " + line;
@@ -22,12 +29,23 @@ function isLobbyState(v: unknown): v is LobbyState {
   );
 }
 
+function isGameState(v: unknown): v is GameState {
+  return (
+    isObject(v) &&
+    v.type === "game_state" &&
+    v.v === 1 &&
+    typeof v.phase === "string"
+  );
+}
+
 export function useRoomController() {
   const [pin, setPin] = useState("");
   const [name, setName] = useState("");
   const [wsStatus, setWsStatus] = useState<WsStatus>("disconnected");
   const [roleHint, setRoleHint] = useState<RoleHint>(null);
+  const [desiredRole, setDesiredRole] = useState<RoleHint>(null);
   const [lobby, setLobby] = useState<LobbyState | null>(null);
+  const [game, setGame] = useState<GameState | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [creating, setCreating] = useState(false);
   const [joining, setJoining] = useState(false);
@@ -38,8 +56,9 @@ export function useRoomController() {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const host = window.location.host;
     const p = pin.trim();
-    return p ? `${proto}://${host}/ws/room/${p}` : "";
-  }, [pin]);
+    const qs = desiredRole ? `?as=${encodeURIComponent(desiredRole)}` : "";
+    return p ? `${proto}://${host}/ws/room/${p}${qs}` : "";
+  }, [pin, desiredRole]);
 
   function push(line: string) {
     setLogs((prev) => [nowLine(line), ...prev].slice(0, 200));
@@ -48,7 +67,9 @@ export function useRoomController() {
   async function createRoom() {
     setCreating(true);
     setRoleHint(null);
+    setDesiredRole(null);
     setLobby(null);
+    setGame(null);
     try {
       const resp = await fetch("/api/rooms/create", { method: "POST" });
       if (!resp.ok) {
@@ -57,6 +78,7 @@ export function useRoomController() {
       }
       const data = (await resp.json()) as { pin: string };
       setPin(data.pin);
+      setDesiredRole("host");
       push(`Created room pin=${data.pin}. (Host cookie should be set.)`);
     } catch (e) {
       push(`Create room failed: ${String(e)}`);
@@ -85,14 +107,17 @@ export function useRoomController() {
         body: JSON.stringify({ pin: p, name: n }),
       });
       if (!resp.ok) {
-        push(`Join failed: HTTP ${resp.status}`);
+        const text = await resp.text().catch(() => "");
+        push(`Join failed: HTTP ${resp.status}${text ? ` ${text}` : ""}`);
         return;
       }
       const data = (await resp.json()) as unknown;
       if (isLobbyState(data)) {
         setLobby(data);
+        setDesiredRole("player");
         push(`Join OK: lobby_state (${data.members.length} members)`);
       } else {
+        setDesiredRole("player");
         push("Join OK");
       }
     } catch (e) {
@@ -100,6 +125,30 @@ export function useRoomController() {
     } finally {
       setJoining(false);
     }
+  }
+
+  function sendWs(msg: ClientMsg) {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      push("WS not connected");
+      return;
+    }
+    wsRef.current.send(JSON.stringify(msg));
+  }
+
+  function hostLockRoom(locked: boolean) {
+    sendWs({ type: "host_lock_room", v: 1, locked });
+  }
+
+  function hostStartGame() {
+    sendWs({ type: "host_start_game", v: 1 });
+  }
+
+  function hostNext() {
+    sendWs({ type: "host_next", v: 1 });
+  }
+
+  function submitAnswer(choiceIndex: number) {
+    sendWs({ type: "answer_submit", v: 1, choiceIndex });
   }
 
   function connectWs() {
@@ -125,8 +174,17 @@ export function useRoomController() {
       push(`WS message: ${text}`);
       try {
         const msg = JSON.parse(text) as unknown;
-        if (isConnectedMsg(msg)) setRoleHint(msg.roleHint);
+        if (isConnectedMsg(msg)) {
+          setRoleHint(msg.roleHint);
+          if (
+            desiredRole == null &&
+            (msg.roleHint === "host" || msg.roleHint === "player")
+          ) {
+            setDesiredRole(msg.roleHint);
+          }
+        }
         if (isLobbyState(msg)) setLobby(msg);
+        if (isGameState(msg)) setGame(msg);
       } catch {
         // ignore
       }
@@ -156,6 +214,7 @@ export function useRoomController() {
     wsStatus,
     roleHint,
     lobby,
+    game,
     logs,
     creating,
     joining,
@@ -163,5 +222,9 @@ export function useRoomController() {
     joinRoom,
     connectWs,
     disconnectWs,
+    hostLockRoom,
+    hostStartGame,
+    hostNext,
+    submitAnswer,
   };
 }
