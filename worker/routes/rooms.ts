@@ -1,15 +1,51 @@
 import type { Env } from "../env";
-import { json, methodNotAllowed } from "../shared/http";
-import { makeSetCookie } from "../shared/cookies";
+import { badRequest, forbidden, json, methodNotAllowed } from "../shared/http";
+import { makeSetCookie, parseCookies } from "../shared/cookies";
 import { log } from "../shared/log";
 import { getRequestId } from "../shared/requestId";
 import { isValidPin } from "../shared/pins";
+import { sha256Hex } from "../shared/hash";
 
 export async function handleCreateRoom(
   request: Request,
   env: Env,
 ): Promise<Response> {
   if (request.method !== "POST") return methodNotAllowed(["POST"]);
+
+  let quizId: string | null = null;
+  const contentType = request.headers.get("Content-Type") ?? "";
+  if (contentType.includes("application/json")) {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return badRequest("invalid_json");
+    }
+
+    const obj: Record<string, unknown> =
+      typeof body === "object" && body !== null && !Array.isArray(body)
+        ? (body as Record<string, unknown>)
+        : {};
+    const candidate = typeof obj.quizId === "string" ? obj.quizId.trim() : "";
+    if (candidate) quizId = candidate;
+  }
+
+  if (quizId) {
+    if (!env.QUIZ_DB)
+      return json({ error: { code: "not_configured" } }, { status: 501 });
+
+    const cookies = parseCookies(request.headers.get("Cookie"));
+    const creator = cookies.qf_creator;
+    if (!creator) return forbidden();
+    const ownerKey = await sha256Hex(creator);
+
+    const row = await env.QUIZ_DB.prepare(
+      "SELECT id FROM quizzes WHERE id = ? AND ownerKey = ? LIMIT 1;",
+    )
+      .bind(quizId, ownerKey)
+      .first();
+    if (!row) return forbidden();
+  }
 
   const reqId = getRequestId(request);
   const pinRegistryId = env.PIN_REGISTRY_DO.idFromName("global");
@@ -36,7 +72,7 @@ export async function handleCreateRoom(
   const initResp = await roomStub.fetch("http://do/init-host", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ hostToken }),
+    body: JSON.stringify({ hostToken, quizId, pin }),
   });
   if (!initResp.ok) {
     log("error", "room.create.room_init_failed", {
@@ -107,7 +143,7 @@ export async function handleJoinRoom(
   const joinResp = await roomStub.fetch("http://do/join", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ playerToken, name }),
+    body: JSON.stringify({ playerToken, name, pin }),
   });
 
   if (!joinResp.ok) {
@@ -138,4 +174,120 @@ export async function handleJoinRoom(
 
   log("info", "room.join", { reqId, pin });
   return json(joinData, { headers });
+}
+
+export async function handleLeaveRoom(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") return methodNotAllowed(["POST"]);
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return badRequest("invalid_json");
+  }
+  const obj: Record<string, unknown> =
+    typeof body === "object" && body !== null && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : {};
+
+  const pin = typeof obj.pin === "string" ? obj.pin.trim() : "";
+  if (!isValidPin(pin)) return badRequest("invalid_pin");
+
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  const as = typeof obj.as === "string" ? obj.as : "";
+  const token =
+    as === "host"
+      ? (cookies.qf_host ?? "")
+      : as === "player"
+        ? (cookies.qf_player ?? "")
+        : (cookies.qf_player ?? cookies.qf_host ?? "");
+  const role =
+    as === "host"
+      ? "host"
+      : as === "player"
+        ? "player"
+        : cookies.qf_player
+          ? "player"
+          : "host";
+  if (!token) return forbidden();
+
+  const roomId = env.ROOM_DO.idFromName(`room:${pin}`);
+  const roomStub = env.ROOM_DO.get(roomId);
+  const resp = await roomStub.fetch("http://do/leave", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, role, pin }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    return new Response(text || null, { status: resp.status });
+  }
+
+  const isHttps = new URL(request.url).protocol === "https:";
+  const headers = new Headers();
+  headers.append(
+    "Set-Cookie",
+    makeSetCookie(role === "host" ? "qf_host" : "qf_player", "", {
+      httpOnly: true,
+      secure: isHttps,
+      sameSite: "Lax",
+      path: "/",
+      maxAgeSeconds: 0,
+    }),
+  );
+  return new Response(null, { status: 204, headers });
+}
+
+export async function handleEndRoom(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") return methodNotAllowed(["POST"]);
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return badRequest("invalid_json");
+  }
+  const obj: Record<string, unknown> =
+    typeof body === "object" && body !== null && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : {};
+
+  const pin = typeof obj.pin === "string" ? obj.pin.trim() : "";
+  if (!isValidPin(pin)) return badRequest("invalid_pin");
+
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  const hostToken = cookies.qf_host ?? "";
+  if (!hostToken) return forbidden();
+
+  const roomId = env.ROOM_DO.idFromName(`room:${pin}`);
+  const roomStub = env.ROOM_DO.get(roomId);
+  const resp = await roomStub.fetch("http://do/end", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hostToken, pin }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    return new Response(text || null, { status: resp.status });
+  }
+
+  const isHttps = new URL(request.url).protocol === "https:";
+  const headers = new Headers();
+  headers.append(
+    "Set-Cookie",
+    makeSetCookie("qf_host", "", {
+      httpOnly: true,
+      secure: isHttps,
+      sameSite: "Lax",
+      path: "/",
+      maxAgeSeconds: 0,
+    }),
+  );
+  return new Response(null, { status: 204, headers });
 }

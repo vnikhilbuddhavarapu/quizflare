@@ -5,9 +5,10 @@ type Props = {
   wsConnected: boolean;
   onToggleLock: () => void;
   onStartGame: () => void;
+  onEndRoom: () => void;
 };
 
-export function HostLobbyPanel({ locked, wsConnected, onToggleLock, onStartGame }: Props) {
+export function HostLobbyPanel({ locked, wsConnected, onToggleLock, onStartGame, onEndRoom }: Props) {
   return (
     <section className="panel">
       <div className="row">
@@ -16,6 +17,9 @@ export function HostLobbyPanel({ locked, wsConnected, onToggleLock, onStartGame 
         </Button>
         <Button onClick={onStartGame} disabled={!wsConnected}>
           Start game
+        </Button>
+        <Button variant="ghost" onClick={onEndRoom}>
+          End room
         </Button>
       </div>
     </section>

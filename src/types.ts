@@ -39,6 +39,7 @@ export type GameState = {
   phaseStartedAtMs: number;
   phaseEndsAtMs: number | null;
   question?: { text: string; options?: string[] };
+  imageUrl?: string;
   reveal?: { correctIndex: number };
   leaderboard?: LeaderboardEntry[];
   answeredCount?: number;

@@ -1,4 +1,3 @@
-
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "quizflare",
@@ -7,27 +6,52 @@
 	"assets": {
 		"not_found_handling": "single-page-application",
 		"binding": "ASSETS",
-		"run_worker_first": ["/api/*", "/ws/*"]
+		"run_worker_first": [
+			"/api/*",
+			"/ws/*"
+		]
 	},
-
 	"durable_objects": {
 		"bindings": [
-			{ "name": "ROOM_DO", "class_name": "RoomDO" },
-			{ "name": "PIN_REGISTRY_DO", "class_name": "PinRegistryDO" }
+			{
+				"name": "ROOM_DO",
+				"class_name": "RoomDO"
+			},
+			{
+				"name": "PIN_REGISTRY_DO",
+				"class_name": "PinRegistryDO"
+			}
 		]
 	},
 	"migrations": [
 		{
 			"tag": "v1",
-			"new_sqlite_classes": ["RoomDO", "PinRegistryDO"]
+			"new_sqlite_classes": [
+				"RoomDO",
+				"PinRegistryDO"
+			]
 		}
 	],
-
 	"observability": {
 		"traces": {
 			"enabled": true
 		},
 		"enabled": true
 	},
-	"placement": {  "mode": "smart" }
+	"placement": {
+		"mode": "smart"
+	},
+	"d1_databases": [
+		{
+			"binding": "QUIZ_DB",
+			"database_name": "quizflare-db",
+			"database_id": "28013b5c-787a-48cf-a858-08c8d0f02b64"
+		}
+	],
+	"r2_buckets": [
+		{
+			"bucket_name": "quizflare-images",
+			"binding": "QUIZ_IMAGES"
+		}
+	]
 }

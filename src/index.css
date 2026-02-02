@@ -3,9 +3,21 @@
   line-height: 1.4;
   font-weight: 400;
 
-  color-scheme: dark;
-  color: rgba(255, 255, 255, 0.92);
-  background-color: #0b0b10;
+  --qf-bg: #f7f7fb;
+  --qf-surface: #ffffff;
+  --qf-surface-2: #f1f2f8;
+  --qf-border: rgba(15, 23, 42, 0.12);
+  --qf-border-strong: rgba(15, 23, 42, 0.18);
+  --qf-text: #0b0b10;
+  --qf-muted: rgba(15, 23, 42, 0.62);
+  --qf-muted-2: rgba(15, 23, 42, 0.45);
+  --qf-accent: #4f46e5;
+  --qf-accent-2: #7c3aed;
+  --qf-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+
+  color-scheme: light;
+  color: #0b0b10;
+  background-color: #f7f7fb;
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -24,6 +36,8 @@ body {
 
 body {
   margin: 0;
+  background: #f7f7fb;
+  color: #0b0b10;
 }
 
 a {

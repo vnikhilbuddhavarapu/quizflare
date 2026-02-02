@@ -26,13 +26,35 @@ export class PinRegistryDO extends DurableObject<Env> {
       return json({ pin });
     }
 
+    if (url.pathname === "/release") {
+      if (request.method !== "POST") return methodNotAllowed(["POST"]);
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return new Response(null, { status: 400 });
+      }
+      const obj: Record<string, unknown> =
+        typeof body === "object" && body !== null && !Array.isArray(body)
+          ? (body as Record<string, unknown>)
+          : {};
+      const pin = typeof obj.pin === "string" ? obj.pin : "";
+      if (!pin) return new Response(null, { status: 400 });
+      this.ctx.storage.sql.exec("DELETE FROM pins WHERE pin = ?;", pin);
+      log("info", "pin.release", { reqId, pin });
+      return new Response(null, { status: 204 });
+    }
+
     return new Response(null, { status: 404 });
   }
 
   private async allocatePin() {
     const maxAttempts = 50;
     for (let i = 0; i < maxAttempts; i++) {
-      const pin = String(Math.floor(Math.random() * 1_000_000)).padStart(6, "0");
+      const pin = String(Math.floor(Math.random() * 1_000_000)).padStart(
+        6,
+        "0",
+      );
       try {
         this.ctx.storage.sql.exec(
           "INSERT INTO pins(pin, createdAtMs) VALUES(?, ?);",

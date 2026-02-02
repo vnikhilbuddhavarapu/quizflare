@@ -4,6 +4,12 @@ import { parseCookies } from "../shared/cookies";
 import { log } from "../shared/log";
 import { getRequestId } from "../shared/requestId";
 
+type RoomMetaRow = {
+  id: number;
+  pin: string | null;
+  idleCleanupAtMs: number | null;
+};
+
 type MemberRow = {
   token: string;
   role: "host" | "player";
@@ -35,56 +41,370 @@ type Question = {
   correctIndex: number;
   answerDurationMs: number;
   previewDurationMs: number;
+  imageUrl?: string;
+  pointsMultiplier: number;
 };
 
-const QUIZ: Question[] = [
-  {
-    id: "q1",
-    text: "What is the capital of France?",
-    options: ["Paris", "Berlin", "Madrid", "Rome"],
-    correctIndex: 0,
-    previewDurationMs: 5000,
-    answerDurationMs: 15000,
-  },
-  {
-    id: "q2",
-    text: "2 + 2 = ?",
-    options: ["3", "4", "5", "22"],
-    correctIndex: 1,
-    previewDurationMs: 5000,
-    answerDurationMs: 12000,
-  },
-];
+type QuizConfigRow = {
+  id: number;
+  quizId: string | null;
+};
 
 export class RoomDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
 
     ctx.blockConcurrencyWhile(async () => {
-      ctx.storage.sql.exec(
-        "CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, role TEXT NOT NULL, createdAtMs INTEGER NOT NULL);",
-      );
-
-      ctx.storage.sql.exec(
-        "CREATE TABLE IF NOT EXISTS members (token TEXT PRIMARY KEY, role TEXT NOT NULL, name TEXT NOT NULL, joinedAtMs INTEGER NOT NULL);",
-      );
-
-      ctx.storage.sql.exec(
-        "CREATE TABLE IF NOT EXISTS scores (token TEXT PRIMARY KEY, score INTEGER NOT NULL);",
-      );
-
-      ctx.storage.sql.exec(
-        "CREATE TABLE IF NOT EXISTS answers (questionIndex INTEGER NOT NULL, token TEXT NOT NULL, choiceIndex INTEGER NOT NULL, submittedAtMs INTEGER NOT NULL, correct INTEGER NOT NULL, points INTEGER NOT NULL, PRIMARY KEY(questionIndex, token));",
-      );
-
-      ctx.storage.sql.exec(
-        "CREATE TABLE IF NOT EXISTS game (id INTEGER PRIMARY KEY CHECK(id=1), phase TEXT NOT NULL, locked INTEGER NOT NULL, questionIndex INTEGER NOT NULL, phaseStartedAtMs INTEGER NOT NULL, phaseEndsAtMs INTEGER);",
-      );
-
-      ctx.storage.sql.exec(
-        "INSERT OR IGNORE INTO game(id, phase, locked, questionIndex, phaseStartedAtMs, phaseEndsAtMs) VALUES(1, 'lobby', 0, 0, 0, NULL);",
-      );
+      await this.ensureSchema();
     });
+  }
+
+  private async ensureSchema() {
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, role TEXT NOT NULL, createdAtMs INTEGER NOT NULL);",
+    );
+
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS members (token TEXT PRIMARY KEY, role TEXT NOT NULL, name TEXT NOT NULL, joinedAtMs INTEGER NOT NULL);",
+    );
+
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS scores (token TEXT PRIMARY KEY, score INTEGER NOT NULL);",
+    );
+
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS answers (questionIndex INTEGER NOT NULL, token TEXT NOT NULL, choiceIndex INTEGER NOT NULL, submittedAtMs INTEGER NOT NULL, correct INTEGER NOT NULL, points INTEGER NOT NULL, PRIMARY KEY(questionIndex, token));",
+    );
+
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS game (id INTEGER PRIMARY KEY CHECK(id=1), phase TEXT NOT NULL, locked INTEGER NOT NULL, questionIndex INTEGER NOT NULL, phaseStartedAtMs INTEGER NOT NULL, phaseEndsAtMs INTEGER);",
+    );
+
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS quiz_config (id INTEGER PRIMARY KEY CHECK(id=1), quizId TEXT);",
+    );
+
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO quiz_config(id, quizId) VALUES(1, NULL);",
+    );
+
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS room_meta (id INTEGER PRIMARY KEY CHECK(id=1), pin TEXT, idleCleanupAtMs INTEGER);",
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO room_meta(id, pin, idleCleanupAtMs) VALUES(1, NULL, NULL);",
+    );
+
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS quiz_questions (idx INTEGER PRIMARY KEY, id TEXT NOT NULL, text TEXT NOT NULL, optionsJson TEXT NOT NULL, correctIndex INTEGER NOT NULL, previewDurationMs INTEGER NOT NULL, answerDurationMs INTEGER NOT NULL, imageUrl TEXT, pointsMultiplier INTEGER NOT NULL);",
+    );
+
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO game(id, phase, locked, questionIndex, phaseStartedAtMs, phaseEndsAtMs) VALUES(1, 'lobby', 0, 0, 0, NULL);",
+    );
+  }
+
+  private getPin(): string | null {
+    const row = this.ctx.storage.sql
+      .exec<RoomMetaRow>(
+        "SELECT pin, idleCleanupAtMs, id FROM room_meta WHERE id = 1;",
+      )
+      .toArray()[0];
+    const pin = row?.pin ?? null;
+    return typeof pin === "string" && pin.length === 6 ? pin : null;
+  }
+
+  private setPin(pin: string) {
+    this.ctx.storage.sql.exec(
+      "UPDATE room_meta SET pin = ? WHERE id = 1;",
+      pin,
+    );
+  }
+
+  private getIdleCleanupAtMs(): number | null {
+    const row = this.ctx.storage.sql
+      .exec<RoomMetaRow>(
+        "SELECT idleCleanupAtMs, pin, id FROM room_meta WHERE id = 1;",
+      )
+      .toArray()[0];
+    const v = row?.idleCleanupAtMs ?? null;
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+
+  private setIdleCleanupAtMs(ts: number | null) {
+    this.ctx.storage.sql.exec(
+      "UPDATE room_meta SET idleCleanupAtMs = ? WHERE id = 1;",
+      ts,
+    );
+  }
+
+  private clearIdleCleanup() {
+    this.setIdleCleanupAtMs(null);
+  }
+
+  private async updateAlarm() {
+    const game = this.getGameRow();
+    const idleAt = this.getIdleCleanupAtMs();
+    const a =
+      typeof game.phaseEndsAtMs === "number" ? game.phaseEndsAtMs : null;
+    const b = typeof idleAt === "number" ? idleAt : null;
+    const next =
+      a != null && b != null
+        ? Math.min(a, b)
+        : a != null
+          ? a
+          : b != null
+            ? b
+            : null;
+    if (next != null) {
+      await this.ctx.storage.setAlarm(next);
+    } else {
+      await this.ctx.storage.deleteAlarm();
+    }
+  }
+
+  private async scheduleIdleCleanupIfEmpty() {
+    if (this.ctx.getWebSockets().length > 0) {
+      this.clearIdleCleanup();
+      await this.updateAlarm();
+      return;
+    }
+    const ms = 10 * 60 * 1000;
+    this.setIdleCleanupAtMs(Date.now() + ms);
+    await this.updateAlarm();
+  }
+
+  private async cleanupRoom(reason: string) {
+    const pin = this.getPin();
+    if (pin) {
+      try {
+        const id = this.env.PIN_REGISTRY_DO.idFromName("global");
+        const stub = this.env.PIN_REGISTRY_DO.get(id);
+        await stub.fetch("http://do/release", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pin }),
+        });
+      } catch {
+        void 0;
+      }
+    }
+
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(1000, reason);
+      } catch {
+        void 0;
+      }
+    }
+
+    try {
+      this.ctx.storage.sql.exec("DELETE FROM sessions;");
+      this.ctx.storage.sql.exec("DELETE FROM members;");
+      this.ctx.storage.sql.exec("DELETE FROM scores;");
+      this.ctx.storage.sql.exec("DELETE FROM answers;");
+      this.ctx.storage.sql.exec("DELETE FROM quiz_questions;");
+      this.ctx.storage.sql.exec(
+        "UPDATE quiz_config SET quizId = NULL WHERE id = 1;",
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE room_meta SET pin = NULL, idleCleanupAtMs = NULL WHERE id = 1;",
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE game SET phase = 'lobby', locked = 0, questionIndex = 0, phaseStartedAtMs = 0, phaseEndsAtMs = NULL WHERE id = 1;",
+      );
+    } catch {
+      void 0;
+    }
+
+    await this.ctx.storage.deleteAll();
+    await this.ensureSchema();
+    await this.updateAlarm();
+  }
+
+  private getQuizId(): string | null {
+    const row = this.ctx.storage.sql
+      .exec<QuizConfigRow>("SELECT quizId FROM quiz_config WHERE id = 1;")
+      .toArray()[0];
+    const quizId = row?.quizId ?? null;
+    return typeof quizId === "string" && quizId.length > 0 ? quizId : null;
+  }
+
+  private getQuizLength(): number {
+    const row = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(1) as n FROM quiz_questions;")
+      .toArray()[0];
+    return row?.n ?? 0;
+  }
+
+  private getQuizQuestion(idx: number): Question | null {
+    const row = this.ctx.storage.sql
+      .exec<{
+        id: string;
+        text: string;
+        optionsJson: string;
+        correctIndex: number;
+        previewDurationMs: number;
+        answerDurationMs: number;
+        imageUrl: string | null;
+        pointsMultiplier: number;
+      }>(
+        "SELECT id, text, optionsJson, correctIndex, previewDurationMs, answerDurationMs, imageUrl, pointsMultiplier FROM quiz_questions WHERE idx = ? LIMIT 1;",
+        idx,
+      )
+      .toArray()[0];
+    if (!row) return null;
+
+    let options: string[] = [];
+    try {
+      const parsed = JSON.parse(row.optionsJson) as unknown;
+      options = Array.isArray(parsed)
+        ? parsed.filter((x): x is string => typeof x === "string")
+        : [];
+    } catch {
+      options = [];
+    }
+
+    return {
+      id: row.id,
+      text: row.text,
+      options,
+      correctIndex: row.correctIndex,
+      previewDurationMs: row.previewDurationMs,
+      answerDurationMs: row.answerDurationMs,
+      imageUrl: row.imageUrl ?? undefined,
+      pointsMultiplier: row.pointsMultiplier,
+    };
+  }
+
+  private loadDefaultQuiz() {
+    this.ctx.storage.sql.exec("DELETE FROM quiz_questions;");
+
+    const questions: Array<{
+      id: string;
+      text: string;
+      options: string[];
+      correctIndex: number;
+      previewDurationMs: number;
+      answerDurationMs: number;
+    }> = [
+      {
+        id: "demo-1",
+        text: "Which planet is known as the Red Planet?",
+        options: ["Earth", "Mars", "Jupiter", "Venus"],
+        correctIndex: 1,
+        previewDurationMs: 3500,
+        answerDurationMs: 12000,
+      },
+      {
+        id: "demo-2",
+        text: "What is the capital of Japan?",
+        options: ["Kyoto", "Seoul", "Tokyo", "Osaka"],
+        correctIndex: 2,
+        previewDurationMs: 3500,
+        answerDurationMs: 12000,
+      },
+      {
+        id: "demo-3",
+        text: "2 + 2 × 2 = ?",
+        options: ["6", "8", "4", "10"],
+        correctIndex: 0,
+        previewDurationMs: 3500,
+        answerDurationMs: 12000,
+      },
+    ];
+
+    for (let i = 0; i < questions.length; i++) {
+      const q = questions[i];
+      this.ctx.storage.sql.exec(
+        "INSERT INTO quiz_questions(idx, id, text, optionsJson, correctIndex, previewDurationMs, answerDurationMs, imageUrl, pointsMultiplier) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        i,
+        q.id,
+        q.text,
+        JSON.stringify(q.options),
+        q.correctIndex,
+        q.previewDurationMs,
+        q.answerDurationMs,
+        null,
+        1,
+      );
+    }
+  }
+
+  private async ensureQuizLoaded() {
+    if (this.getQuizLength() > 0) return;
+
+    const quizId = this.getQuizId();
+    if (!quizId || !this.env.QUIZ_DB) {
+      this.loadDefaultQuiz();
+      return;
+    }
+
+    const questions = await this.env.QUIZ_DB.prepare(
+      "SELECT id, position, prompt, timeLimitMs, pointsMultiplier, imageKey FROM questions WHERE quizId = ? ORDER BY position ASC;",
+    )
+      .bind(quizId)
+      .all<{
+        id: string;
+        position: number;
+        prompt: string;
+        timeLimitMs: number;
+        pointsMultiplier: number;
+        imageKey: string | null;
+      }>();
+
+    const qRows = questions.results ?? [];
+    const questionIds = qRows.map((q) => q.id);
+
+    const optionsByQ = new Map<string, string[]>();
+    const answersByQ = new Map<string, number[]>();
+
+    if (questionIds.length > 0) {
+      const optRes = await this.env.QUIZ_DB.prepare(
+        `SELECT questionId, position, text FROM options WHERE questionId IN (${questionIds.map(() => "?").join(",")}) ORDER BY questionId ASC, position ASC;`,
+      )
+        .bind(...questionIds)
+        .all<{ questionId: string; position: number; text: string }>();
+
+      for (const r of optRes.results ?? []) {
+        const arr = optionsByQ.get(r.questionId) ?? [];
+        arr[r.position] = r.text;
+        optionsByQ.set(r.questionId, arr);
+      }
+
+      const ansRes = await this.env.QUIZ_DB.prepare(
+        `SELECT questionId, optionPosition FROM answers WHERE questionId IN (${questionIds.map(() => "?").join(",")}) ORDER BY questionId ASC, optionPosition ASC;`,
+      )
+        .bind(...questionIds)
+        .all<{ questionId: string; optionPosition: number }>();
+
+      for (const r of ansRes.results ?? []) {
+        const arr = answersByQ.get(r.questionId) ?? [];
+        arr.push(r.optionPosition);
+        answersByQ.set(r.questionId, arr);
+      }
+    }
+
+    this.ctx.storage.sql.exec("DELETE FROM quiz_questions;");
+    for (let i = 0; i < qRows.length; i++) {
+      const q = qRows[i];
+      const options = (optionsByQ.get(q.id) ?? []).filter(Boolean);
+      const correctIndices = answersByQ.get(q.id) ?? [];
+      const correctIndex = correctIndices[0] ?? 0;
+      const imageUrl = q.imageKey ? `/api/questions/${q.id}/image` : null;
+      this.ctx.storage.sql.exec(
+        "INSERT INTO quiz_questions(idx, id, text, optionsJson, correctIndex, previewDurationMs, answerDurationMs, imageUrl, pointsMultiplier) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        i,
+        q.id,
+        q.prompt,
+        JSON.stringify(options),
+        correctIndex,
+        5000,
+        q.timeLimitMs,
+        imageUrl,
+        q.pointsMultiplier,
+      );
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -104,6 +424,8 @@ export class RoomDO extends DurableObject<Env> {
             : {};
         const hostToken =
           typeof obj.hostToken === "string" ? obj.hostToken : "";
+        const quizId = typeof obj.quizId === "string" ? obj.quizId : null;
+        const pin = typeof obj.pin === "string" ? obj.pin : "";
         if (!hostToken) return new Response(null, { status: 400 });
 
         this.ctx.storage.sql.exec(
@@ -111,6 +433,17 @@ export class RoomDO extends DurableObject<Env> {
           hostToken,
           Date.now(),
         );
+
+        this.ctx.storage.sql.exec(
+          "UPDATE quiz_config SET quizId = ? WHERE id = 1;",
+          quizId,
+        );
+
+        if (/^[0-9]{6}$/.test(pin)) {
+          this.setPin(pin);
+        }
+        this.clearIdleCleanup();
+        await this.updateAlarm();
 
         log("info", "room.init_host", { reqId });
         await this.broadcastLobbyState();
@@ -130,6 +463,7 @@ export class RoomDO extends DurableObject<Env> {
         const playerToken =
           typeof obj.playerToken === "string" ? obj.playerToken : "";
         const name = typeof obj.name === "string" ? obj.name.trim() : "";
+        const pin = typeof obj.pin === "string" ? obj.pin : "";
         if (!playerToken) return new Response(null, { status: 400 });
         if (name.length < 1 || name.length > 20)
           return new Response(null, { status: 400 });
@@ -166,6 +500,12 @@ export class RoomDO extends DurableObject<Env> {
           playerToken,
         );
 
+        if (/^[0-9]{6}$/.test(pin)) {
+          this.setPin(pin);
+        }
+        this.clearIdleCleanup();
+        await this.updateAlarm();
+
         log("info", "room.join", { reqId });
         const lobby = await this.getLobbyState();
         await this.broadcastLobbyState(lobby);
@@ -174,6 +514,79 @@ export class RoomDO extends DurableObject<Env> {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
+      }
+
+      if (url.pathname === "/leave") {
+        if (request.method !== "POST")
+          return new Response(null, { status: 405 });
+
+        const body = await request.json().catch(() => null);
+        const obj: Record<string, unknown> =
+          typeof body === "object" && body !== null && !Array.isArray(body)
+            ? (body as Record<string, unknown>)
+            : {};
+        const token = typeof obj.token === "string" ? obj.token : "";
+        const role = typeof obj.role === "string" ? obj.role : "";
+        const pin = typeof obj.pin === "string" ? obj.pin : "";
+        if (!token) return new Response(null, { status: 400 });
+        if (role !== "host" && role !== "player")
+          return new Response(null, { status: 400 });
+        if (/^[0-9]{6}$/.test(pin)) {
+          this.setPin(pin);
+        }
+
+        this.ctx.storage.sql.exec(
+          "DELETE FROM members WHERE token = ? AND role = ?;",
+          token,
+          role,
+        );
+        this.ctx.storage.sql.exec("DELETE FROM scores WHERE token = ?;", token);
+        this.ctx.storage.sql.exec(
+          "DELETE FROM answers WHERE token = ?;",
+          token,
+        );
+
+        for (const ws of this.ctx.getWebSockets()) {
+          try {
+            for (const tag of this.ctx.getTags(ws)) {
+              if (tag === token) {
+                ws.close(1000, "leave");
+              }
+            }
+          } catch {
+            void 0;
+          }
+        }
+
+        await this.broadcastLobbyState();
+        await this.broadcastGameState();
+        await this.scheduleIdleCleanupIfEmpty();
+        return new Response(null, { status: 204 });
+      }
+
+      if (url.pathname === "/end") {
+        if (request.method !== "POST")
+          return new Response(null, { status: 405 });
+
+        const body = await request.json().catch(() => null);
+        const obj: Record<string, unknown> =
+          typeof body === "object" && body !== null && !Array.isArray(body)
+            ? (body as Record<string, unknown>)
+            : {};
+        const hostToken =
+          typeof obj.hostToken === "string" ? obj.hostToken : "";
+        const pin = typeof obj.pin === "string" ? obj.pin : "";
+        if (!hostToken) return new Response(null, { status: 400 });
+        if (/^[0-9]{6}$/.test(pin)) {
+          this.setPin(pin);
+        }
+
+        const r = await this.getRoleHintFromToken(hostToken);
+        if (r !== "host") return new Response(null, { status: 403 });
+
+        log("info", "room.end", { reqId });
+        await this.cleanupRoom("room_ended");
+        return new Response(null, { status: 204 });
       }
     }
 
@@ -206,7 +619,10 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
-    log("info", "room.ws.connect", { reqId, hasHost, hasPlayer });
+    log("info", "room.ws.connect", { reqId, hasHost, hasPlayer, roleHint });
+
+    this.clearIdleCleanup();
+    await this.updateAlarm();
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -214,15 +630,32 @@ export class RoomDO extends DurableObject<Env> {
     if (token) this.ctx.acceptWebSocket(server, [token]);
     else this.ctx.acceptWebSocket(server);
 
-    server.send(JSON.stringify({ type: "connected", v: 1, roleHint }));
+    this.ctx.waitUntil(
+      (async () => {
+        try {
+          server.send(JSON.stringify({ type: "connected", v: 1, roleHint }));
+        } catch {
+          return;
+        }
 
-    const lobby = await this.getLobbyState();
-    server.send(JSON.stringify(lobby));
+        const lobby = await this.getLobbyState();
+        try {
+          server.send(JSON.stringify(lobby));
+        } catch {
+          // ignore
+        }
 
-    const gameState = this.getGameState();
-    server.send(JSON.stringify(gameState));
-    await this.broadcastLobbyState(lobby);
-    await this.broadcastGameState(gameState);
+        const gameState = this.getGameState();
+        try {
+          server.send(JSON.stringify(gameState));
+        } catch {
+          // ignore
+        }
+
+        await this.broadcastLobbyState(lobby);
+        await this.broadcastGameState(gameState);
+      })(),
+    );
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -250,6 +683,9 @@ export class RoomDO extends DurableObject<Env> {
     const role = await this.getRoleHintFromToken(token);
     if (!token || !role) return;
 
+    this.clearIdleCleanup();
+    await this.updateAlarm();
+
     if (type === "host_lock_room") {
       if (role !== "host") return;
       const locked = msg.locked === true ? 1 : 0;
@@ -264,9 +700,30 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     if (type === "host_start_game") {
-      if (role !== "host") return;
+      if (role !== "host") {
+        log("warn", "room.host_start_game.ignored", {
+          reason: "not_host",
+          role,
+        });
+        return;
+      }
       const game = this.getGameRow();
-      if (game.phase !== "lobby") return;
+      if (game.phase !== "lobby") {
+        log("warn", "room.host_start_game.ignored", {
+          reason: "not_in_lobby",
+          phase: game.phase,
+        });
+        return;
+      }
+
+      await this.ensureQuizLoaded();
+      if (this.getQuizLength() < 1) {
+        log("error", "room.host_start_game.ignored", {
+          reason: "no_questions_loaded",
+          quizId: this.getQuizId(),
+        });
+        return;
+      }
 
       this.ctx.storage.sql.exec("DELETE FROM answers;");
       this.ctx.storage.sql.exec("UPDATE scores SET score = 0;");
@@ -299,7 +756,7 @@ export class RoomDO extends DurableObject<Env> {
       }
       if (game.phase === "scoreboard") {
         const nextIndex = game.questionIndex + 1;
-        if (nextIndex >= QUIZ.length) {
+        if (nextIndex >= this.getQuizLength()) {
           await this.setPhase({
             phase: "finished",
             questionIndex: game.questionIndex,
@@ -328,7 +785,7 @@ export class RoomDO extends DurableObject<Env> {
         typeof msg.choiceIndex === "number" ? msg.choiceIndex : -1;
       const game = this.getGameRow();
       if (game.phase !== "answering") return;
-      const q = QUIZ[game.questionIndex];
+      const q = this.getQuizQuestion(game.questionIndex);
       if (!q) return;
       if (
         !Number.isInteger(choiceIndex) ||
@@ -358,7 +815,9 @@ export class RoomDO extends DurableObject<Env> {
       const timeFactor =
         duration > 0 ? Math.min(1, Math.max(0, remaining / duration)) : 0;
       const points =
-        correct === 1 ? Math.round(1000 * (0.3 + 0.7 * timeFactor)) : 0;
+        correct === 1
+          ? Math.round(1000 * q.pointsMultiplier * (0.3 + 0.7 * timeFactor))
+          : 0;
 
       this.ctx.storage.sql.exec(
         "INSERT INTO answers(questionIndex, token, choiceIndex, submittedAtMs, correct, points) VALUES(?, ?, ?, ?, ?, ?);",
@@ -384,17 +843,35 @@ export class RoomDO extends DurableObject<Env> {
     log("info", "room.ws.close", { code, reason });
     await this.broadcastLobbyState();
     await this.broadcastGameState();
+    await this.scheduleIdleCleanupIfEmpty();
   }
 
   async alarm() {
     const game = this.getGameRow();
     const now = Date.now();
+
+    const idleAt = this.getIdleCleanupAtMs();
+    if (idleAt != null && now >= idleAt) {
+      if (this.ctx.getWebSockets().length < 1) {
+        log("info", "room.cleanup.idle", { reason: "idle" });
+        await this.cleanupRoom("room_idle");
+        return;
+      }
+      this.clearIdleCleanup();
+      await this.updateAlarm();
+    }
+
     if (game.phaseEndsAtMs != null && now < game.phaseEndsAtMs) {
+      await this.updateAlarm();
       return;
     }
 
+    if (this.getQuizLength() < 1) {
+      await this.ensureQuizLoaded();
+    }
+
     if (game.phase === "countdown") {
-      const q = QUIZ[game.questionIndex];
+      const q = this.getQuizQuestion(game.questionIndex);
       if (!q) return;
       const started = Date.now();
       await this.setPhase({
@@ -409,7 +886,7 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     if (game.phase === "question_preview") {
-      const q = QUIZ[game.questionIndex];
+      const q = this.getQuizQuestion(game.questionIndex);
       if (!q) return;
       const started = Date.now();
       await this.setPhase({
@@ -447,6 +924,8 @@ export class RoomDO extends DurableObject<Env> {
       await this.broadcastGameState();
       return;
     }
+
+    await this.updateAlarm();
   }
 
   private async getRoleHintFromToken(
@@ -574,7 +1053,7 @@ export class RoomDO extends DurableObject<Env> {
 
   private getGameState(precomputed?: GameRow) {
     const game = precomputed ?? this.getGameRow();
-    const q = QUIZ[game.questionIndex] ?? null;
+    const q = this.getQuizQuestion(game.questionIndex);
     const base: Record<string, unknown> = {
       type: "game_state",
       v: 1,
@@ -599,11 +1078,15 @@ export class RoomDO extends DurableObject<Env> {
     if (!q) return base;
 
     if (game.phase === "question_preview") {
-      return { ...base, question: { text: q.text } };
+      return { ...base, question: { text: q.text }, imageUrl: q.imageUrl };
     }
 
     if (game.phase === "answering") {
-      return { ...base, question: { text: q.text, options: q.options } };
+      return {
+        ...base,
+        question: { text: q.text, options: q.options },
+        imageUrl: q.imageUrl,
+      };
     }
 
     if (game.phase === "reveal") {
@@ -611,6 +1094,7 @@ export class RoomDO extends DurableObject<Env> {
         ...base,
         question: { text: q.text, options: q.options },
         reveal: { correctIndex: q.correctIndex },
+        imageUrl: q.imageUrl,
       };
     }
 
@@ -619,6 +1103,7 @@ export class RoomDO extends DurableObject<Env> {
         ...base,
         question: { text: q.text, options: q.options },
         reveal: { correctIndex: q.correctIndex },
+        imageUrl: q.imageUrl,
       };
     }
 
@@ -655,10 +1140,6 @@ export class RoomDO extends DurableObject<Env> {
       next.phaseEndsAtMs,
     );
 
-    if (next.phaseEndsAtMs != null) {
-      await this.ctx.storage.setAlarm(next.phaseEndsAtMs);
-    } else {
-      await this.ctx.storage.deleteAlarm();
-    }
+    await this.updateAlarm();
   }
 }

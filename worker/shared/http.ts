@@ -1,6 +1,7 @@
 export function json(data: unknown, init?: ResponseInit) {
   const headers = new Headers(init?.headers);
-  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (!headers.has("Content-Type"))
+    headers.set("Content-Type", "application/json");
   return new Response(JSON.stringify(data), { ...init, headers });
 }
 
@@ -17,4 +18,8 @@ export function notFound() {
 
 export function badRequest(message: string) {
   return json({ error: { code: "bad_request", message } }, { status: 400 });
+}
+
+export function forbidden() {
+  return json({ error: { code: "forbidden" } }, { status: 403 });
 }

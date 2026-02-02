@@ -6,11 +6,10 @@ type Props = {
   roleHint: string | null;
   members: LobbyMember[];
   wsStatus: string;
-  onConnectWs: () => void;
-  onDisconnectWs: () => void;
+  onLeave?: () => void;
 };
 
-export function LobbyPage({ pin, roleHint, members, wsStatus, onConnectWs, onDisconnectWs }: Props) {
+export function LobbyPage({ pin, roleHint, members, wsStatus, onLeave }: Props) {
   return (
     <section className="panel">
       <div className="row">
@@ -25,15 +24,20 @@ export function LobbyPage({ pin, roleHint, members, wsStatus, onConnectWs, onDis
             <span className="metaKey">WS:</span> <span className="mono">{wsStatus}</span>
           </div>
         </div>
-        {wsStatus === "disconnected" ? (
-          <Button variant="secondary" onClick={onConnectWs} disabled={!pin.trim()}>
-            Connect WS
-          </Button>
-        ) : (
-          <Button variant="ghost" onClick={onDisconnectWs}>
-            Disconnect
-          </Button>
-        )}
+        <div className="row" style={{ gap: 10, alignItems: "center" }}>
+          {roleHint === "player" && onLeave ? (
+            <Button variant="ghost" onClick={onLeave}>
+              Leave
+            </Button>
+          ) : null}
+          <div className="pill">
+            {wsStatus === "connected"
+              ? "Connected"
+              : wsStatus === "connecting"
+                ? "Connecting…"
+                : "Reconnecting…"}
+          </div>
+        </div>
       </div>
       <div className="panelTitle">Lobby</div>
       <div className="lobbyList">
